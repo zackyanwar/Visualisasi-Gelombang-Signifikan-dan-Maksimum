@@ -1,0 +1,184 @@
+import numpy as np
+import netCDF4
+import matplotlib
+import matplotlib.pyplot as plt
+from mpl_toolkits.basemap import Basemap
+import os
+import calendar
+import geopandas as gpd
+import pandas as pd
+
+#fugsi untuk plotting peta
+def plot_monthly_avg_swh(lon, lon1, lon2, lat, lat1, lat2, llint, mag, u, v,
+                         skip, scale, tahun_awal, tahun_akhir, bulan, bln, dir_hasil, shp_file=None):
+    if not os.path.exists(dir_hasil):
+        os.makedirs(dir_hasil)
+
+    lons, lats = np.meshgrid(lon, lat)
+
+    map = Basemap(projection='merc',
+                  llcrnrlon=lon1,
+                  urcrnrlon=lon2,
+                  llcrnrlat=lat1,
+                  urcrnrlat=lat2,
+                  resolution='f')
+    map.drawcoastlines(linewidth=0.2)
+    map.drawcountries(linewidth=0.2)
+    map.fillcontinents(color='white')
+    map.drawparallels(np.arange(lat1, lat2, llint), labels=[1, 0, 0, 0], dashes=[1, 1], linewidth=0.3, color='k', fontsize=5)
+    map.drawmeridians(np.arange(lon1, lon2, llint), labels=[0, 0, 0, 1], dashes=[1, 1], linewidth=0.3, color='k', fontsize=5)
+
+    #masking daratan
+    x, y = map(lons, lats)
+    land_mask = np.zeros_like(mag, dtype=bool)
+    for i in range(mag.shape[0]):
+        for j in range(mag.shape[1]):
+            land_mask[i, j] = map.is_land(x[i, j], y[i, j])
+    mag_masked = np.ma.masked_where(land_mask, mag)
+
+    #colormap dan colorbar
+    cmap = matplotlib.colors.ListedColormap(["#0859E7", "#3075BD", "#63C3E7", "#55FBBD", "#48D342",
+                                             "#FFFB52", "#F9AD39", "#F7792A", "#A54518", "#E74941",
+                                             "#CE2C38", "#EF37CE", "#B5349C"])
+    cmap.set_over('indigo')
+    bounds = [0, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7]
+    norm = matplotlib.colors.BoundaryNorm(bounds, cmap.N)
+
+    swh = map.contourf(x, y, mag_masked, cmap=cmap, norm=norm, levels=bounds, extend='max')
+    cbar = map.colorbar(swh, 'bottom', ticks=bounds, spacing='uniform', extendfrac='auto', pad=0.2)
+    cbar.set_ticklabels([str(b) for b in bounds])
+    cbar.ax.tick_params(labelsize=7)
+    cbar.set_label('Ketinggian Gelombang (m)', fontsize=6)
+
+    map.quiver(x[::skip, ::skip], y[::skip, ::skip], u[::skip, ::skip], v[::skip, ::skip],
+               units='inches', scale=scale, pivot='mid', width=0.0058)
+
+    # Tambah poligon shapefile + nomor wilayah
+    nomor_data = []
+    if shp_file:
+        try:
+            gdf = gpd.read_file(shp_file)
+            if gdf.crs != 'EPSG:4326':
+                gdf = gdf.to_crs(epsg=4326)
+
+            visible_polygons = []
+            for idx, row in gdf.iterrows():
+                geom = row['geometry']
+                if geom.is_empty:
+                    continue
+                if geom.geom_type == 'Polygon':
+                    if lon1 <= geom.centroid.x <= lon2 and lat1 <= geom.centroid.y <= lat2:
+                        visible_polygons.append((geom, row))
+                elif geom.geom_type == 'MultiPolygon':
+                    for poly in geom:
+                        if lon1 <= poly.centroid.x <= lon2 and lat1 <= poly.centroid.y <= lat2:
+                            visible_polygons.append((poly, row))
+
+            for i, (poly, row) in enumerate(visible_polygons):
+                x_poly, y_poly = map(*zip(*poly.exterior.coords))
+                map.plot(x_poly, y_poly, color='black', linewidth=0.4)
+
+                centroid = poly.centroid
+                x_text, y_text = map(centroid.x, centroid.y)
+                plt.text(x_text, y_text, str(i + 1), fontsize=6, ha='center', va='center', fontweight='bold', color='black')
+
+                nomor_data.append({'Nomor': i + 1, 'Nama': row.get('name', 'N/A'), 'Lon': centroid.x, 'Lat': centroid.y})
+
+            df_nomor = pd.DataFrame(nomor_data)
+            df_nomor.to_csv(os.path.join(dir_hasil, f'nomor_wilayah_{bulan}_{tahun_awal}_{tahun_akhir}.csv'), index=False)
+
+        except Exception as e:
+            print(f"Error loading shapefile: {e}")
+
+    plt.title(f'Rerata Ketinggian Gelombang Signifikan Bulan {bulan} ({tahun_awal}-{tahun_akhir})')
+    plt.savefig(f'{dir_hasil}/hs_{bulan}_{bln}_{tahun_awal}-{tahun_akhir}.png', dpi=300, bbox_inches='tight')
+    plt.clf()
+    plt.cla()
+    plt.close()
+    print(f'Plotting selesai untuk bulan {bulan}!')
+
+# Fungsi untuk mengunduh data
+def download_data(bln, tahun):
+    dset = netCDF4.Dataset
+    hs = np.empty([0, 481, 881]) # Menggunakan hs untuk ketinggian gelombang signifikan
+    dir_hs = np.empty([0, 481, 881]) # Tetap menggunakan arah gelombang
+
+    try:
+        eod = calendar.monthrange(int(tahun), int(bln))[1]
+        tanggal = ['%.2d' % i for i in range(1, eod + 1)]
+        for tgl in tanggal:
+            ncfile = f'w3g_hires_{tahun}{bln}{tgl}_1200.nc'
+            try:
+                url = f'https://renderofs:AksesTerbatas2303!!!@peta-maritim.bmkg.go.id/opendap/ww3gfs/{tahun}/{bln}/{ncfile}'
+                data = dset(url)
+                hs_0 = data.variables['hs'][0, :, :]
+                dir_0 = data.variables['dir'][0, :, :]
+                hs = np.append(hs, [hs_0], axis=0)
+                dir_hs = np.append(dir_hs, [dir_0], axis=0)
+            except:
+                print(f'Data untuk {tahun}-{bln}-{tgl} tidak ditemukan.')
+        lon = data.variables['lon'][:]
+        lat = data.variables['lat'][:]
+        return [hs, dir_hs, lat, lon]
+    except Exception as e:
+        print("Terjadi kesalahan:", e)
+        return None
+
+# Main program untuk beberapa bulan
+if __name__ == '__main__':
+    tahun_awal = 2020
+    tahun_akhir = 2024
+
+    bl = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+          'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember']
+
+    lon1, lon2 = 131, 140
+    lat1, lat2 = -11, -4
+    llint = 2
+    skip = 5
+    scale = 25
+    dir_hasil = 'C:\\Users\\LENOVO\\Documents\\skripsi\\Buletin' # Menentukan direktori hasil output
+    shp_file = 'C:\\Users\\LENOVO\\OneDrive\\Documents\\skripsi\\wilmetos.shp'
+
+    # Iterasi untuk setiap bulan dalam rentang bulan yang ditentukan
+    for bulan in [7, 8, 9, 10, 11, 12]:
+        bln = '{:02d}'.format(bulan)
+        nama_bulan = bl[bulan - 1]
+
+    # Menyiapkan list untuk menyimpan data hs dan dir_hs untuk setiap bulan
+        hs_total = []
+        dir_total = []
+        lat = lon = None
+
+        # Mengunduh data untuk bulan dan rentang tahun yang diinginkan
+        print(f"\nMemproses bulan: {nama_bulan}")
+        for tahun in range(tahun_awal, tahun_akhir + 1):
+            print(f"  Mengunduh data untuk tahun {tahun} bulan {bln}")
+            data = download_data(bln, tahun)
+            if data:
+                hs_total.append(data[0])
+                dir_total.append(data[1])
+                if lat is None and lon is None:
+                    lat = data[2]
+                    lon = data[3]
+
+        if len(hs_total) == 0 or len(dir_total) == 0:
+            print(f"Tidak ada data untuk bulan {nama_bulan}. Lewatkan...")
+            continue
+
+        # Gabungkan data hs dan dir_hs untuk seluruh bulan dan tahun yang ada
+        hs_total = np.concatenate(hs_total, axis=0)
+        dir_total = np.concatenate(dir_total, axis=0)
+        # Hitung rata-rata untuk rentang bulan dan tahun
+        hsrat = np.mean(hs_total, axis=0)
+        dir_hs = dir_total * np.pi / 180
+        udir = 2. * np.sin(dir_hs)
+        vdir = 2. * np.cos(dir_hs)
+        urat = np.mean(udir, axis=0)
+        vrat = np.mean(vdir, axis=0)
+        uv_rat = np.arctan2(urat, vrat)
+        u = 2. * np.cos(uv_rat)
+        v = 2. * np.sin(uv_rat)
+        # Plot hasil untuk bulan tersebut
+        plot_monthly_avg_swh(lon, lon1, lon2, lat, lat1, lat2, llint, hsrat, u, v,
+                             skip, scale, tahun_awal, tahun_akhir, nama_bulan, bln, dir_hasil, shp_file)
