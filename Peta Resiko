@@ -1,0 +1,185 @@
+import numpy as np
+import netCDF4
+import matplotlib
+from mpl_toolkits.basemap import Basemap
+import os
+import calendar
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# Fungsi untuk plotting peta dengan menambahkan poligon wilayah perairan dan nomor
+def plot_monthly_avg_hs_tongkang(lon, lon1, lon2, lat, lat1, lat2, llint, mag, u, v, skip, scale, tahun_awal, tahun_akhir, bulan, bln, dir_hasil, shp_file=None):
+    if not os.path.exists(dir_hasil):
+        os.makedirs(dir_hasil)
+
+    lons, lats = np.meshgrid(lon, lat)
+
+    # Proyeksi peta
+    map = Basemap(projection='merc',
+                  llcrnrlon=lon1,
+                  urcrnrlon=lon2,
+                  llcrnrlat=lat1,
+                  urcrnrlat=lat2,
+                  resolution='f')
+    map.drawcoastlines(linewidth=0.2)
+    map.drawcountries(linewidth=0.2)
+    map.fillcontinents(color='white')
+    map.drawparallels(np.arange(lat1, lat2, llint), labels=[1, 0, 0, 0], dashes=[1, 1], linewidth=0.3, color='k', fontsize=5)
+    map.drawmeridians(np.arange(lon1, lon2, llint), labels=[0, 0, 0, 1], dashes=[1, 1], linewidth=0.3, color='k', fontsize=5)
+
+    # Masking daratan
+    x, y = map(lons, lats)
+    land_mask = np.zeros_like(mag, dtype=bool)
+    for i in range(mag.shape[0]):
+        for j in range(mag.shape[1]):
+            land_mask[i, j] = map.is_land(x[i, j], y[i, j])
+
+    mag_masked = np.ma.masked_where(land_mask, mag)
+
+    # Colormap untuk kapal tongkang dengan kategori risiko
+    cmap = matplotlib.colors.ListedColormap(["#00FF00", "#FFFF00", "#FF0000"])  # Hijau, Kuning, Merah
+    cmap.set_over('#FF0000')  # Merah untuk gelombang tinggi (>1,5 meter)
+    bounds = [0, 1, 1.5, 7]  # Batasan kategori risiko
+    norm = matplotlib.colors.BoundaryNorm(bounds, cmap.N)
+
+    # Plotting gelombang
+    hs = map.contourf(x, y, mag_masked, cmap=cmap, norm=norm, levels=bounds, extend='max')
+
+    # Menambahkan colorbar
+    cbar = map.colorbar(hs, 'bottom', spacing='uniform', extendfrac='auto', pad=0.2)
+    cbar.set_ticks([0.5, 1.25, 3.25])  # Menyesuaikan dengan batasan kategori risiko
+    cbar.set_ticklabels(['Low (<1 m)', 'Moderate (1-1.5 m)', 'High (>1.5 m)'])
+    cbar.ax.tick_params(labelsize=7)
+    cbar.set_label('Kategori Risiko', fontsize=6)
+
+    # Menambahkan vektor angin
+    map.quiver(x[::skip, ::skip], y[::skip, ::skip], u[::skip, ::skip], v[::skip, ::skip], units='inches', scale=scale, pivot='mid', width=0.0058)
+
+    # Jika ada shapefile, beri nomor hanya wilayah dalam jangkauan peta
+    nomor_data = []
+    if shp_file:
+        try:
+            gdf = gpd.read_file(shp_file)
+            if gdf.crs != 'EPSG:4326':
+                gdf = gdf.to_crs(epsg=4326)
+
+            visible_polygons = []
+            for idx, row in gdf.iterrows():
+                geom = row['geometry']
+                if geom.is_empty:
+                    continue
+                if geom.geom_type == 'Polygon':
+                    if lon1 <= geom.centroid.x <= lon2 and lat1 <= geom.centroid.y <= lat2:
+                        visible_polygons.append((geom, row))
+                elif geom.geom_type == 'MultiPolygon':
+                    for poly in geom:
+                        if lon1 <= poly.centroid.x <= lon2 and lat1 <= poly.centroid.y <= lat2:
+                            visible_polygons.append((poly, row))
+
+            for i, (poly, row) in enumerate(visible_polygons):
+                x_poly, y_poly = map(*zip(*poly.exterior.coords))
+                map.plot(x_poly, y_poly, color='black', linewidth=0.4)
+
+                centroid = poly.centroid
+                x_text, y_text = map(centroid.x, centroid.y)
+                plt.text(x_text, y_text, str(i + 1), fontsize=6, ha='center', va='center', fontweight='bold', color='blue')
+
+                nomor_data.append({'Nomor': i + 1, 'Nama': row.get('name', 'N/A'), 'Lon': centroid.x, 'Lat': centroid.y})
+
+            # Simpan ke CSV
+            df_nomor = pd.DataFrame(nomor_data)
+            df_nomor.to_csv(os.path.join(dir_hasil, f'nomor_wilayah_{bulan}_{tahun_awal}_{tahun_akhir}.csv'), index=False)
+
+        except Exception as e:
+            print(f"Error loading shapefile: {e}")
+
+    # Menambahkan judul dan menyimpan gambar    
+    plt.title(f'Level Peta Risiko Gelombang Kapal Tongkang Bulan {bulan} ({tahun_awal}-{tahun_akhir})')
+    plt.savefig(f'{dir_hasil}hs_{bulan}_{bln}_{tahun_awal}-{tahun_akhir}.png', dpi=300, bbox_inches='tight')
+    plt.clf()
+    plt.cla()
+    plt.close()
+    print('Plotting selesai!')
+
+# Fungsi unduh data def
+def download_data(bln, tahun):
+    try:
+        hs = []
+        dir_hs = []
+        eod = calendar.monthrange(int(tahun), int(bln))[1]
+        tanggal = ['%.2d' % i for i in range(1, eod + 1)]
+
+        for tgl in tanggal:
+            ncfile = f'w3g_hires_{tahun}{bln}{tgl}_1200.nc'
+            try:
+                url = f'https://renderofs:AksesTerbatas2303!!!@peta-maritim.bmkg.go.id/opendap/ww3gfs/{tahun}/{bln}/{ncfile}'
+                data = netCDF4.Dataset(url)
+                hs_0 = data.variables['hs'][0, :, :]
+                dir_0 = data.variables['dir'][0, :, :]
+                hs.append(hs_0)
+                dir_hs.append(dir_0)
+            except Exception as e:
+                print(f'Data tidak ditemukan untuk {ncfile}: {e}')
+                continue  # Jika data tidak ditemukan, lanjutkan ke tanggal berikutnya
+
+        hs_total = np.array(hs)
+        dir_total = np.array(dir_hs)
+
+        lon = data.variables['lon'][:]
+        lat = data.variables['lat'][:]
+        return [hs_total, dir_total, lat, lon]
+
+    except Exception as e:
+        print(f"Terjadi kesalahan umum: {e}")
+        return None
+
+# Main
+if __name__ == '__main__':
+    bulan_awal = 9
+    bulan_akhir = 12
+    tahun_awal = 2020
+    tahun_akhir = 2024
+
+    bl = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember']
+    dir_hasil = 'C:\\Users\\LENOVO\\Documents\\skripsi\\Buletin'
+    shp_file = r'C:\\Users\\LENOVO\\OneDrive\\Documents\\skripsi\\wilmetos.shp'
+
+    for bulan in range(bulan_awal, bulan_akhir + 1):
+        bln = '{:02d}'.format(bulan)
+        nama_bulan = bl[bulan - 1]
+
+        hs_total = []
+        dir_total = []
+
+        for tahun in range(tahun_awal, tahun_akhir + 1):  
+            print(f"Mengunduh data untuk {nama_bulan} {tahun}")
+            data = download_data(bln, tahun)
+            if data:
+                hs_total.append(data[0])
+                dir_total.append(data[1])
+            else:
+                print(f"Tidak ada data untuk {nama_bulan} {tahun}, melanjutkan ke tahun berikutnya...")
+
+        if hs_total and dir_total:  # Pastikan data ada sebelum melanjutkan ke perhitungan rata-rata
+            hs_total = np.concatenate(hs_total, axis=0)
+            dir_total = np.concatenate(dir_total, axis=0)
+
+            hs_avg = np.mean(hs_total, axis=0)
+            dir_hs = dir_total * np.pi / 180
+            udir = 2. * np.sin(dir_hs)
+            vdir = 2. * np.cos(dir_hs)
+            urat = np.mean(udir, axis=0)
+            vrat = np.mean(vdir, axis=0)
+            uv_rat = np.arctan2(urat, vrat)
+            u = 2. * np.cos(uv_rat)
+            v = 2. * np.sin(uv_rat)
+
+            plot_monthly_avg_hs_tongkang(data[3], 131, 140, data[2], -11, -4, 2, hs_avg, u, v,
+                                          5, 25, tahun_awal, tahun_akhir, nama_bulan, bln, dir_hasil, shp_file)
+
+        else:
+            print(f"Tidak ada data yang valid untuk {nama_bulan} {tahun_awal}-{tahun_akhir}, lanjut ke bulan berikutnya.")
+        
+        hs_total = []
+        dir_total = []
